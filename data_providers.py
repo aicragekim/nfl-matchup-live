@@ -1,139 +1,72 @@
-import io
-import gzip
-import requests
 import pandas as pd
 import numpy as np
 
+# New: use nfl_data_py instead of hand-written GitHub URLs
+import nfl_data_py as nfl
+
 # Shown in the Streamlit header so you can confirm the running build
-CODE_VERSION = "v1.3-sched-espn-pbp-fallback"
+CODE_VERSION = "v2.0-nfl_data_py"
 
-# ---------- SCHEDULE SOURCES ----------
-# nflverse (try .gz then .csv)
-SCHEDULE_URLS = [
-    "https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data/schedules.csv.gz",
-    "https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data/schedules.csv",
-]
-
-# ESPN scoreboard (used as season-specific fallback)
-# Example: https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week=3&seasontype=2&dates=2025
-
-# ---------- PLAY-BY-PLAY SOURCE ----------
-# Published per season; some future seasons may not exist yet
-PBP_PARQUET_TMPL = (
-    "https://github.com/nflverse/nflfastR-data/releases/download/pbp_{season}/"
-    "play_by_play_{season}.parquet"
-)
-PBP_FALLBACK_SEASON = 2024  # latest widely available parquet at time of writing
-
-
-# ============ HTTP UTIL ============
-def _http_get(url, headers=None, timeout=30):
-    h = {"User-Agent": "matchup-app/1.0"}
-    if headers:
-        h.update(headers)
-    r = requests.get(url, headers=h, timeout=timeout)
-    r.raise_for_status()
-    return r
+# If a brand-new season isn't fully published yet in nflverse,
+# we can optionally fall back to last season to keep the app alive.
+FALLBACK_SEASON = None  # set e.g. 2024 if you want a forced fallback
 
 
 # ============ SCHEDULES ============
-def _fetch_schedule_nflverse() -> pd.DataFrame:
-    """
-    Try nflverse schedules from known URLs. Returns all seasons if available.
-    """
-    last_err = None
-    for url in SCHEDULE_URLS:
-        try:
-            r = _http_get(url)
-            if url.endswith(".gz"):
-                df = pd.read_csv(io.BytesIO(gzip.decompress(r.content)))
-            else:
-                df = pd.read_csv(io.BytesIO(r.content))
-            cols = ["season", "week", "gameday", "away_team", "home_team", "game_type"]
-            if not set(cols).issubset(df.columns):
-                raise ValueError(f"Missing columns: {set(cols)-set(df.columns)}")
-            return df[cols]
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"nflverse schedules unavailable. Last error: {last_err}")
-
-
-def _fetch_schedule_espn_full_season(season: int) -> pd.DataFrame:
-    """
-    Build a REG-season schedule by pulling ESPN's scoreboard for weeks 1..18.
-    """
-    rows = []
-    for wk in range(1, 19):
-        url = f"https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard?week={wk}&seasontype=2&dates={season}"
-        try:
-            data = _http_get(url).json()
-        except Exception:
-            continue  # skip week if ESPN hiccups
-        for ev in data.get("events", []):
-            comps = (ev.get("competitions") or [{}])[0]
-            teams = comps.get("competitors") or []
-            if len(teams) != 2:
-                continue
-            home = next((t for t in teams if t.get("homeAway") == "home"), None)
-            away = next((t for t in teams if t.get("homeAway") == "away"), None)
-            if not home or not away:
-                continue
-            home_abbr = (((home.get("team") or {}).get("abbreviation")) or "").upper()
-            away_abbr = (((away.get("team") or {}).get("abbreviation")) or "").upper()
-            gameday = ev.get("date")  # ISO timestamp string
-            if home_abbr and away_abbr:
-                rows.append({
-                    "season": season,
-                    "week": wk,
-                    "gameday": gameday,
-                    "away_team": away_abbr,
-                    "home_team": home_abbr,
-                    "game_type": "REG",
-                })
-    return pd.DataFrame(rows, columns=["season", "week", "gameday", "away_team", "home_team", "game_type"])
-
-
 def fetch_schedule() -> pd.DataFrame:
     """
-    Try nflverse first (all seasons). If it fails, return an empty shell.
-    streamlit_app will detect empty and call the ESPN season builder.
+    Return all schedules available (all seasons) with the columns we use.
+    nfl_data_py handles fetching from the correct nflverse-data releases.
     """
-    try:
-        return _fetch_schedule_nflverse()
-    except Exception:
-        return pd.DataFrame(columns=["season", "week", "gameday", "away_team", "home_team", "game_type"])
-
-
-def fetch_schedule_for_season_from_espn(season: int) -> pd.DataFrame:
-    """Build a REG-season schedule for a single season via ESPN."""
-    return _fetch_schedule_espn_full_season(season)
+    # nfl.import_schedules returns a big table across seasons
+    sched = nfl.import_schedules(years=True)  # True = all available seasons
+    # Normalize to the columns your app expects
+    cols = ["season", "week", "gameday", "away_team", "home_team", "game_type"]
+    out = pd.DataFrame({
+        "season": sched["season"],
+        "week": sched["week"],
+        "gameday": sched["gameday"],
+        "away_team": sched["away_team"].str.upper(),
+        "home_team": sched["home_team"].str.upper(),
+        "game_type": sched["game_type"].str.upper(),
+    })
+    # Filter to only real NFL games (REG/POST); keep PRE if you want preseason picks
+    out = out[out["game_type"].isin(["REG", "POST"])]
+    return out[cols]
 
 
 # ============ PLAY-BY-PLAY ============
 def fetch_pbp_season(season: int) -> pd.DataFrame:
     """
-    Try to fetch play-by-play parquet for the requested season.
-    If not available (e.g., future season), fall back to PBP_FALLBACK_SEASON.
-    Adds a __fallback_notice__ column if a fallback was used.
+    Load play-by-play for a given season using nfl_data_py.
+    If the requested season isn't fully available (early in the year), optionally
+    fall back to a previous season to keep the app running.
     """
     season = int(season)
-    url = PBP_PARQUET_TMPL.format(season=season)
+    seasons = [season]
+    fb_used = ""
+
     try:
-        r = _http_get(url)
-        df = pd.read_parquet(io.BytesIO(r.content), engine="pyarrow")
-        df["__fallback_notice__"] = ""
-        return df
+        pbp = nfl.import_pbp_data(seasons)
+        if pbp.empty and FALLBACK_SEASON:
+            fb_used = f"⚠️ {season} PBP not fully available — using {FALLBACK_SEASON}"
+            pbp = nfl.import_pbp_data([FALLBACK_SEASON]).copy()
+            # Keep downstream filters working as if it's the requested season
+            if "season" in pbp.columns:
+                pbp["season"] = season
     except Exception:
-        fb = int(PBP_FALLBACK_SEASON)
-        fb_url = PBP_PARQUET_TMPL.format(season=fb)
-        r = _http_get(fb_url)
-        df = pd.read_parquet(io.BytesIO(r.content), engine="pyarrow")
-        df["__fallback_notice__"] = f"⚠️ {season} PBP not yet available — using {fb}"
-        # Normalize season field so downstream filters still work using caller's season
-        if "season" in df.columns:
-            df["season"] = season
-        return df
+        if FALLBACK_SEASON:
+            fb_used = f"⚠️ {season} PBP load error — using {FALLBACK_SEASON}"
+            pbp = nfl.import_pbp_data([FALLBACK_SEASON]).copy()
+            if "season" in pbp.columns:
+                pbp["season"] = season
+        else:
+            # Surface a clean empty DF; the UI will show "insufficient data"
+            pbp = pd.DataFrame()
+
+    if not pbp.empty and "__fallback_notice__" not in pbp.columns:
+        pbp["__fallback_notice__"] = fb_used
+    return pbp
 
 
 # ============ METRICS BUILDERS ============
@@ -143,8 +76,25 @@ def compute_team_unit_metrics(pbp: pd.DataFrame, season: int, week: int):
     Offense: EPA/play, success%, explosive% + OL proxies (pass/run block win).
     Defense: EPA/success/explosive allowed + pressure and run-stop proxies.
     """
+    if pbp is None or pbp.empty:
+        return (
+            pd.DataFrame(columns=["team", "unit", "epa_per_play", "success_rate",
+                                  "explosive_rate", "pass_block_win", "run_block_win"]),
+            pd.DataFrame(columns=["team", "unit", "epa_allowed", "success_allowed",
+                                  "explosive_allowed", "pressure_rate",
+                                  "run_stop_win", "coverage_grade"])
+        )
+
     df = pbp.copy()
-    df = df[(df["season"] == season) & (df["week"] <= int(week)) & (df["season_type"] == "REG")]
+    # nfl_data_py already includes season_type column (REG/POST)
+    if "season_type" in df.columns:
+        df = df[(df["season"] == season) &
+                (df["week"] <= int(week)) &
+                (df["season_type"].str.upper() == "REG")]
+    else:
+        df = df[(df["season"] == season) & (df["week"] <= int(week))]
+
+    # Keep only run/pass plays with valid EPA
     df = df[df["play_type"].isin(["pass", "run"]) & df["epa"].notna()].copy()
 
     # Success/explosive definitions
@@ -261,14 +211,10 @@ def compute_team_unit_metrics(pbp: pd.DataFrame, season: int, week: int):
 
 # ============ OPTIONAL ENRICHMENT STUBS ============
 def enrich_with_espn_winrates(offense_units: pd.DataFrame, defense_units: pd.DataFrame, enabled: bool):
-    """
-    Placeholder for ESPN pass/rush block win-rate ingestion.
-    """
+    """Placeholder for ESPN pass/rush block win-rate ingestion."""
     return offense_units, defense_units, False
 
 
 def enrich_with_sportsdataio(offense_units: pd.DataFrame, defense_units: pd.DataFrame, api_key: str | None):
-    """
-    Placeholder for SportsDataIO-based enrichment.
-    """
+    """Placeholder for SportsDataIO-based enrichment."""
     return offense_units, defense_units, False
