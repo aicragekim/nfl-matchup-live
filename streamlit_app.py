@@ -1,21 +1,28 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+
 from data_providers import (
-    fetch_schedule, fetch_pbp_season, compute_team_unit_metrics,
-    enrich_with_espn_winrates, enrich_with_sportsdataio, CODE_VERSION
+    fetch_schedule,
+    fetch_pbp_season,
+    compute_team_unit_metrics,
+    enrich_with_espn_winrates,
+    enrich_with_sportsdataio,
+    CODE_VERSION,                       # build tag shown in UI
+    fetch_schedule_for_season_from_espn # single-season ESPN fallback
 )
 
-# ---------- Page header ----------
+# =======================
+# Page & sidebar controls
+# =======================
 st.set_page_config(page_title="NFL Matchup Picks — Live", layout="wide")
 st.title("🏈 NFL Matchup Picks — Live (nflverse)")
 st.caption(f"Build: {CODE_VERSION}")
 
-# ---------- Sidebar controls ----------
 with st.sidebar:
     st.header("Data source & season")
     season = st.number_input("Season (year)", min_value=2015, max_value=2100, value=2025, step=1)
-    week = st.number_input("Week (1-18)", min_value=1, max_value=18, value=3, step=1)
+    week = st.number_input("Week (1–18)", min_value=1, max_value=18, value=3, step=1)
 
     st.header("Optional adapters")
     espn_enable = st.toggle("Try ESPN Win Rates (experimental)", value=False)
@@ -28,38 +35,42 @@ with st.sidebar:
     w_te = st.slider("TE weight", 0.0, 3.0, 0.6, 0.05)
     w_ol = st.slider("OL weight", 0.0, 3.0, 1.1, 0.05)
 
-    qb_cov_w = st.slider("QB vs Coverage share", 0.0, 1.0, 0.6, 0.05)
-    rb_run_w = st.slider("RB vs Run D share", 0.0, 1.0, 0.65, 0.05)
+    qb_cov_w   = st.slider("QB vs Coverage share", 0.0, 1.0, 0.6, 0.05)
+    rb_run_w   = st.slider("RB vs Run D share", 0.0, 1.0, 0.65, 0.05)
     te_covlb_w = st.slider("TE vs Coverage LB share", 0.0, 1.0, 0.55, 0.05)
-    ol_pass_w = st.slider("OL Pass Pro share", 0.0, 1.0, 0.6, 0.05)
+    ol_pass_w  = st.slider("OL Pass Pro share", 0.0, 1.0, 0.6, 0.05)
 
     dep_strength = st.slider("Trench impact on pass game", 0.0, 2.0, 1.0, 0.05)
     close_margin = st.slider("Close-game margin (net edge)", 0.0, 1.0, 0.15, 0.01)
 
-# ---------- Cached loaders ----------
+# =================
+# Cached data calls
+# =================
 @st.cache_data(show_spinner=True)
 def load_schedule():
     return fetch_schedule()
 
 @st.cache_data(show_spinner=True)
-def load_pbp(season: int):
-    return fetch_pbp_season(season)
+def load_pbp(season_: int):
+    return fetch_pbp_season(int(season_))
 
 @st.cache_data(show_spinner=True)
-def build_units(pbp, season, week, espn_enable, sdio_enable):
-    off, deff = compute_team_unit_metrics(pbp, season, int(week))
-    if espn_enable:
+def build_units(pbp, season_, week_, espn_enable_, sdio_enable_):
+    off, deff = compute_team_unit_metrics(pbp, int(season_), int(week_))
+    if espn_enable_:
         off, deff, ok = enrich_with_espn_winrates(off, deff, True)
         if not ok:
             st.info("ESPN win-rate enrichment not implemented in this sample.")
-    if sdio_enable:
+    if sdio_enable_:
         key = st.secrets.get("SPORTSDATAIO_KEY", None)
         off, deff, ok = enrich_with_sportsdataio(off, deff, key)
-        if not ok and key:
+        if key and not ok:
             st.info("SportsDataIO enrichment stub not implemented in this sample.")
     return off, deff
 
-# ---------- Helpers ----------
+# =========
+# Utilities
+# =========
 def normalize(series, invert=False):
     s = pd.to_numeric(series, errors="coerce")
     if s.dropna().nunique() <= 1:
@@ -149,6 +160,7 @@ def unit_matchup(off_team, def_team, off_map, def_map, qb_cov_w, rb_run_w, te_co
 def adjusted_team_edge(off_team, def_team, off_map, def_map, dep_strength, weights, qb_cov_w, rb_run_w, te_covlb_w, ol_pass_w):
     raw = unit_matchup(off_team, def_team, off_map, def_map, qb_cov_w, rb_run_w, te_covlb_w, ol_pass_w)
     ol_edge = raw["OL"]
+    # pass-game dependency scaling (TTF)
     ttf = 1.0 if pd.isna(ol_edge) else np.clip(0.6 + 0.4 * ol_edge * dep_strength, 0.2, 1.0)
     adj = {
         "QB": raw["QB"] * ttf if pd.notna(raw["QB"]) else np.nan,
@@ -165,23 +177,36 @@ def adjusted_team_edge(off_team, def_team, off_map, def_map, dep_strength, weigh
     team_edge = (total / wsum) if wsum > 0 else np.nan
     return team_edge, raw, adj, ttf
 
-# ---------- Main: load data ----------
-# Schedule (safe error handling)
+# ======================
+# Load schedule & PBP
+# ======================
+# Schedule with robust error handling + ESPN fallback for selected season
 try:
-    sched = load_schedule()
+    sched = load_schedule()  # nflverse (all seasons)
 except Exception as e:
-    st.error(f"Could not load schedule: {e}")
+    st.error(f"Could not load schedule index: {e}")
     st.stop()
 
-# PBP + unit tables
+if sched.empty:
+    # nflverse failed → build REG-season schedule for selected season from ESPN
+    with st.spinner("Building schedule from ESPN…"):
+        try:
+            sched = fetch_schedule_for_season_from_espn(int(season))
+        except Exception as e:
+            st.error(f"Could not build schedule from ESPN: {e}")
+            st.stop()
+
+# PBP & unit tables
 pbp = load_pbp(season)
 off_u, def_u = build_units(pbp, season, week, espn_enable, sdio_enable)
 of = unitize_offense(off_u)
 df = unitize_defense(def_u)
 off_map, def_map = build_maps(of, df)
 
-# ---------- Build and render week ----------
-wk = sched[(sched["season"] == season) & (sched["week"] == week) & (sched["game_type"] == "REG")].copy()
+# ======================
+# Render matchups
+# ======================
+wk = sched[(sched["season"] == int(season)) & (sched["week"] == int(week)) & (sched["game_type"] == "REG")].copy()
 if wk.empty:
     st.warning("No regular-season games found in the schedule for that week.")
 else:
@@ -232,6 +257,6 @@ else:
                 st.metric("Overall adjusted edge (away offense)", f"{away_edge:+.3f}")
 
             st.markdown("---")
-            st.metric("Net team edge (home - away)", f"{net:+.3f}")
+            st.metric("Net team edge (home − away)", f"{net:+.3f}")
             st.caption(f"Verdict threshold for 'close game' = ±{close_margin:.2f}")
 
