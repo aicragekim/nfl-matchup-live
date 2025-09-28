@@ -1,7 +1,8 @@
 
 import io, gzip, requests, pandas as pd, numpy as np
 
-NFLVERSE_SCHEDULE_GZ = "https://raw.githubusercontent.com/nflverse/nflfastR-data/master/schedules.csv.gz"
+NFLVERSE_SCHEDULE_GZ = "https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data/schedules.csv.gz"
+
 PBP_PARQUET_TMPL = "https://github.com/nflverse/nflfastR-data/releases/download/pbp_{season}/play_by_play_{season}.parquet"
 
 def _http_get(url, headers=None):
