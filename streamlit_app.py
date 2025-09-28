@@ -1,11 +1,15 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from data_providers import fetch_schedule, fetch_pbp_season, compute_team_unit_metrics, enrich_with_espn_winrates, enrich_with_sportsdataio
+from data_providers import (
+    fetch_schedule, fetch_pbp_season, compute_team_unit_metrics,
+    enrich_with_espn_winrates, enrich_with_sportsdataio, CODE_VERSION
+)
 
 st.set_page_config(page_title="NFL Matchup Picks — Live", layout="wide")
 st.title("🏈 NFL Matchup Picks — Live (nflverse)")
+st.caption(f"Build: {CODE_VERSION}")
+
 
 with st.sidebar:
     st.header("Data source & season")
